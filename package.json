@@ -1,8 +1,8 @@
 {
   "name": "pi-env",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Pi extension that sets process environment variables from settings.json",
-  "author": "ksjf977",
+  "author": "lucascajal",
   "license": "MIT",
   "type": "module",
   "keywords": [

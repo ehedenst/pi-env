@@ -19,7 +19,7 @@ pi install npm:pi-env
 Or from git:
 
 ```bash
-pi install https://github.com/ksjf977/pi-env
+pi install https://github.com/lucascajal/pi-env
 ```
 
 ## Usage
@@ -42,6 +42,8 @@ Add an `"env"` key to your global or project settings:
 
 Environment variables are set before providers initialize, so they're available when pi makes API requests.
 
+Note that if environment variables are used by other extensions make sure to load pi-env before them in `settings.json`. 
+
 ## Variable interpolation
 
 Reference pre-existing environment variables using pi's value resolution syntax:
@@ -50,6 +52,7 @@ Reference pre-existing environment variables using pi's value resolution syntax:
 |--------|---------|
 | `$ENV_VAR` | Value of `ENV_VAR` from the shell environment |
 | `${ENV_VAR}` | Same, braced form (useful when followed by text) |
+| `!ENV_CMD` | Output of `ENV_CMD` when executed in the shell environment |
 | `$$` | Literal `$` character |
 | `literal` | Used as-is |
 
@@ -58,6 +61,7 @@ Reference pre-existing environment variables using pi's value resolution syntax:
   "env": {
     "API_URL": "https://${REGION}.api.example.com/v1",
     "AUTH_TOKEN": "$VAULT_TOKEN",
+    "TEST_TOKEN": "!openssl rand -hex 32",
     "PRICE": "$$9.99"
   }
 }
@@ -88,6 +92,7 @@ Shell exports apply to every process. With `pi-env`, you can:
 - Override `AWS_REGION` per-project without changing your shell profile
 - Keep provider routing config versioned with the project
 - Avoid wrapper functions like `pi() { VAR=x command pi "$@"; }`
+- Use a secrets manager for environment variables
 
 ## License
 

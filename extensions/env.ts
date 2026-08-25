@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -17,6 +18,7 @@ import { Text } from "@earendil-works/pi-tui";
  * {
  *   "env": {
  *     "ANTHROPIC_API_KEY": "$MY_SECRET_KEY",
+ *     "OPENROUTER_API_KEY": "!secret_manager openrouter/key",
  *     "OPENAI_API_KEY": "sk-...",
  *     "GOOGLE_CLOUD_PROJECT": "my-project",
  *     "GOOGLE_CLOUD_LOCATION": "us-central1",
@@ -42,13 +44,20 @@ interface EnvReport {
 
 function resolveValue(value: string): { resolved: string; missing: string[] } {
   const missing: string[] = [];
-  const resolved = value.replace(ENV_VAR_PATTERN, (match, braced, bare) => {
+  let resolved = value.replace(ENV_VAR_PATTERN, (match, braced, bare) => {
     if (match === "$$") return "$";
     const varName = braced ?? bare;
     const val = process.env[varName];
     if (val === undefined) missing.push(varName);
     return val ?? "";
   });
+  if (resolved.startsWith('!')) {
+    try {
+      resolved = execSync(resolved.slice(1), { encoding: 'utf8' }).trim();
+    } catch (error) {
+      missing.push(resolved.slice(1));
+    }
+  }
   return { resolved, missing };
 }
 
