@@ -81,7 +81,7 @@ function interpolate(value: string, missing: string[]): string {
 function resolveValue(
   value: string,
   allowExec: boolean
-): { resolved?: string; missing: string[]; blockedCommand?: string; failed?: boolean } {
+): { resolved?: string; missing: string[]; blockedCommand?: string; failed?: string } {
   const missing: string[] = [];
 
   // The leading "!" must be literal in settings — it is checked before
@@ -113,10 +113,23 @@ function resolveValue(
     const resolved = output.trim();
     commandCache.set(command, resolved);
     return { resolved, missing };
-  } catch {
+  } catch (err) {
     // Report by key, not command: the interpolated command may contain secrets.
-    return { missing, failed: true };
+    return { missing, failed: failureReason(err) };
   }
+}
+
+// Short, single-line, control-char-free reason for a failed "!command".
+function failureReason(err: unknown): string {
+  const e = err as { code?: string; signal?: string | null; status?: number | null; stderr?: string | Buffer };
+  let head = e.code ?? "error";
+  if (e.code === "ETIMEDOUT" || e.signal) head = "timed out";
+  else if (e.status != null) head = `exit ${e.status}`;
+  const stderr = String(e.stderr ?? "")
+    .split("\n")[0]
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .slice(0, 120);
+  return stderr ? `${head}: ${stderr}` : head;
 }
 
 function extractEnv(settings: unknown): Record<string, unknown> | undefined {
@@ -205,7 +218,7 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
       }
       const { resolved, missing, blockedCommand, failed } = resolveValue(String(value), source.allowExec);
       if (blockedCommand) blockedCommandKeys.push(key);
-      if (failed) failedCommandKeys.push(key);
+      if (failed) failedCommandKeys.push(`${key} (${failed})`);
       unresolvedVars.push(...missing);
       if (resolved === undefined) continue;
       process.env[key] = resolved;
@@ -300,7 +313,8 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     // ponytail: re-runs global "!command"s once more when the project is trusted
     if (ctx.isProjectTrusted()) startup = applyEnv(ctx.cwd, true);
-    if (!ctx.hasUI) return;
+    // Headless (-p, json, rpc): no theme, so fall back to plain stderr.
+    const fg = ctx.hasUI ? ctx.ui.theme.fg.bind(ctx.ui.theme) : (_c: string, t: string) => t;
 
     const warnings: Array<[string, string[]]> = [
       ["ignoring non-scalar values:", startup.nonScalarKeys],
@@ -313,14 +327,14 @@ export default function (pi: ExtensionAPI): void {
     ];
     const lines = warnings
       .filter(([, keys]) => keys.length > 0)
-      .map(([label, keys]) => `  ${ctx.ui.theme.fg("warning", label)} ${keys.join(", ")}`);
+      .map(([label, keys]) => `  ${fg("warning", label)} ${keys.join(", ")}`);
+    if (lines.length === 0) return;
 
-    if (lines.length > 0) {
-      pi.sendMessage({
-        customType: MESSAGE_TYPE,
-        content: ctx.ui.theme.fg("accent", "[env]") + "\n" + lines.join("\n"),
-        display: true,
-      });
+    const content = fg("accent", "[env]") + "\n" + lines.join("\n");
+    if (!ctx.hasUI) {
+      console.error(content);
+      return;
     }
+    pi.sendMessage({ customType: MESSAGE_TYPE, content, display: true });
   });
 }
