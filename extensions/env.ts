@@ -42,42 +42,60 @@ interface EnvReport {
   variables: Record<string, string>;
 }
 
+interface EnvResult {
+  reports: EnvReport[];
+  unresolvedVars: string[];
+  overriddenVars: string[];
+  nonScalarKeys: string[];
+  blockedCommandKeys: string[];
+}
+
+function interpolate(value: string, missing: string[]): string {
+  return value.replace(ENV_VAR_PATTERN, (match, braced, bare) => {
+    if (match === "$$") return "$";
+    const varName = braced ?? bare;
+    const resolved = process.env[varName];
+    if (resolved === undefined) missing.push(varName);
+    return resolved ?? "";
+  });
+}
+
 function resolveValue(
   value: string,
   allowExec: boolean
 ): { resolved: string; missing: string[]; blockedCommand?: string } {
   const missing: string[] = [];
-  let resolved = value.replace(ENV_VAR_PATTERN, (match, braced, bare) => {
-    if (match === "$$") return "$";
-    const varName = braced ?? bare;
-    const val = process.env[varName];
-    if (val === undefined) missing.push(varName);
-    return val ?? "";
-  });
-  if (resolved.startsWith('!')) {
-    const command = resolved.slice(1);
-    if (!allowExec) {
-      // "!command" execution is only trusted from global settings
-      // (~/.pi/agent/settings.json). Project settings (.pi/settings.json)
-      // ship inside repositories and are not a trusted execution source,
-      // so refuse to run the command and surface it as a warning instead.
-      return { resolved: "", missing, blockedCommand: command };
-    }
-    try {
-      resolved = execSync(command, {
-        encoding: 'utf8',
-        timeout: 5000,
-        maxBuffer: 1024 * 1024,
-      }).trim();
-    } catch (error) {
-      missing.push(command);
-    }
+
+  // The leading "!" must be literal in settings — it is checked before
+  // interpolation so an interpolated env var value can never become a command.
+  if (!value.startsWith("!")) {
+    return { resolved: interpolate(value, missing), missing };
   }
-  return { resolved, missing };
+
+  // "!command" execution is only trusted from global settings
+  // (~/.pi/agent/settings.json). Project settings (.pi/settings.json) ship
+  // inside repositories and are not a trusted execution source, so refuse to
+  // run the command and surface it as a warning instead.
+  const command = interpolate(value.slice(1), missing);
+  if (!allowExec) return { resolved: "", missing, blockedCommand: command };
+
+  try {
+    const output = execSync(command, {
+      encoding: 'utf8',
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+    });
+    return { resolved: output.trim(), missing };
+  } catch {
+    missing.push(command);
+    return { resolved: "", missing };
+  }
 }
 
-function extractEnv(settings: object): Record<string, unknown> | undefined {
-  const vars = Reflect.get(settings, CONFIG_KEY);
+function extractEnv(settings: unknown): Record<string, unknown> | undefined {
+  // Settings come from untyped JSON, so narrow before reading the "env" key.
+  if (!settings || typeof settings !== "object") return undefined;
+  const vars = (settings as Record<string, unknown>)[CONFIG_KEY];
   if (!vars || typeof vars !== "object" || Array.isArray(vars)) return undefined;
   return Object.keys(vars).length > 0 ? (vars as Record<string, unknown>) : undefined;
 }
@@ -86,104 +104,84 @@ function isScalar(value: unknown): value is string | number | boolean {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 
-function applyEnv(cwd: string): {
-  reports: EnvReport[];
-  unresolvedVars: string[];
-  overriddenVars: string[];
-  nonScalarKeys: string[];
-  blockedCommandKeys: string[];
-} {
+function readTracked(key: string): string[] {
+  try {
+    return process.env[key] ? JSON.parse(process.env[key]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeTracked(key: string, values: string[]): void {
+  if (values.length > 0) process.env[key] = JSON.stringify(values);
+  else delete process.env[key];
+}
+
+function applyEnv(cwd: string): EnvResult {
   const settingsManager = SettingsManager.create(cwd);
-  const globalEnvRaw = extractEnv(settingsManager.getGlobalSettings());
-  const projectEnvRaw = extractEnv(settingsManager.getProjectSettings());
+  const sources = [
+    { name: "global", vars: extractEnv(settingsManager.getGlobalSettings()), allowExec: true },
+    { name: "project", vars: extractEnv(settingsManager.getProjectSettings()), allowExec: false },
+  ];
 
-  // Merge: project overrides global
-  const merged = { ...globalEnvRaw, ...projectEnvRaw };
+  const previousKeys = readTracked(TRACKER_KEY);
+  const previousOverrides = readTracked(OVERRIDES_KEY);
 
-  const nonScalarKeys = Object.keys(merged).filter((k) => !isScalar(merged[k]));
-  const scalarKeys = Object.keys(merged).filter((k) => isScalar(merged[k]));
+  // Snapshot before mutating: a key already present in the environment was put
+  // there by something else, unless we set it on a previous load.
+  const preExisting = new Set(
+    sources
+      .flatMap((source) => Object.keys(source.vars ?? {}))
+      .filter((key) => process.env[key] !== undefined && !previousKeys.includes(key))
+  );
+
+  const reports: EnvReport[] = [];
+  const unresolvedVars: string[] = [];
+  const nonScalarKeys: string[] = [];
+  const blockedCommandKeys: string[] = [];
+  const appliedKeys: string[] = [];
+
+  // Later sources override earlier ones, so project wins over global.
+  for (const source of sources) {
+    if (!source.vars) continue;
+    const variables: Record<string, string> = {};
+    for (const [key, value] of Object.entries(source.vars)) {
+      if (!isScalar(value)) {
+        nonScalarKeys.push(key);
+        continue;
+      }
+      const { resolved, missing, blockedCommand } = resolveValue(String(value), source.allowExec);
+      if (blockedCommand) blockedCommandKeys.push(key);
+      unresolvedVars.push(...missing);
+      process.env[key] = resolved;
+      if (!appliedKeys.includes(key)) appliedKeys.push(key);
+      variables[key] = resolved;
+    }
+    if (Object.keys(variables).length > 0) {
+      reports.push({ source: source.name, variables });
+    }
+  }
 
   // Clean up stale vars from a previous load (e.g. after /reload with keys removed)
-  const previousKeys: string[] = process.env[TRACKER_KEY]
-    ? JSON.parse(process.env[TRACKER_KEY])
-    : [];
-  const previousOverrides: string[] = process.env[OVERRIDES_KEY]
-    ? JSON.parse(process.env[OVERRIDES_KEY])
-    : [];
-  const removedKeys = previousKeys.filter((k) => !scalarKeys.includes(k));
-  for (const key of removedKeys) {
-    delete process.env[key];
+  for (const key of previousKeys) {
+    if (!appliedKeys.includes(key)) delete process.env[key];
   }
 
-  const unresolvedVars: string[] = [];
-  const overriddenVars: string[] = [];
-  const blockedCommandKeys: string[] = [];
-  const reports: EnvReport[] = [];
-
-  // Process global (trusted source: "!command" execution is allowed)
-  if (globalEnvRaw) {
-    const vars: Record<string, string> = {};
-    for (const [key, value] of Object.entries(globalEnvRaw)) {
-      if (!isScalar(value)) continue;
-      const strValue = String(value);
-      const { resolved, missing, blockedCommand } = resolveValue(strValue, true);
-      if (blockedCommand) blockedCommandKeys.push(key);
-      unresolvedVars.push(...missing);
-      if (
-        (process.env[key] !== undefined && !previousKeys.includes(key)) ||
-        previousOverrides.includes(key)
-      ) {
-        overriddenVars.push(key);
-      }
-      process.env[key] = resolved;
-      vars[key] = resolved;
-    }
-    if (Object.keys(vars).length > 0) {
-      reports.push({ source: "global", variables: vars });
-    }
-  }
-
-  // Process project (overrides global). Project settings ship inside
-  // repositories and are not a trusted execution source, so "!command"
-  // values are refused here (see resolveValue's allowExec=false).
-  if (projectEnvRaw) {
-    const vars: Record<string, string> = {};
-    for (const [key, value] of Object.entries(projectEnvRaw)) {
-      if (!isScalar(value)) continue;
-      const strValue = String(value);
-      const { resolved, missing, blockedCommand } = resolveValue(strValue, false);
-      if (blockedCommand) blockedCommandKeys.push(key);
-      unresolvedVars.push(...missing);
-      if (
-        (process.env[key] !== undefined &&
-          !previousKeys.includes(key) &&
-          !overriddenVars.includes(key) &&
-          !globalEnvRaw?.[key]) ||
-        (previousOverrides.includes(key) && !overriddenVars.includes(key))
-      ) {
-        overriddenVars.push(key);
-      }
-      process.env[key] = resolved;
-      vars[key] = resolved;
-    }
-    if (Object.keys(vars).length > 0) {
-      reports.push({ source: "project", variables: vars });
-    }
-  }
+  const overriddenVars = appliedKeys.filter(
+    (key) => preExisting.has(key) || previousOverrides.includes(key)
+  );
 
   // Track current keys and overrides for reload persistence
-  if (scalarKeys.length > 0) {
-    process.env[TRACKER_KEY] = JSON.stringify(scalarKeys);
-  } else {
-    delete process.env[TRACKER_KEY];
-  }
-  if (overriddenVars.length > 0) {
-    process.env[OVERRIDES_KEY] = JSON.stringify(overriddenVars);
-  } else {
-    delete process.env[OVERRIDES_KEY];
-  }
+  writeTracked(TRACKER_KEY, appliedKeys);
+  writeTracked(OVERRIDES_KEY, overriddenVars);
 
-  return { reports, unresolvedVars, overriddenVars, nonScalarKeys, blockedCommandKeys };
+  return {
+    reports,
+    unresolvedVars: [...new Set(unresolvedVars)],
+    overriddenVars,
+    nonScalarKeys: [...new Set(nonScalarKeys)],
+    blockedCommandKeys,
+  };
 }
 
 function formatReport(
@@ -206,8 +204,7 @@ function formatReport(
 
 export default function (pi: ExtensionAPI): void {
   // Apply env vars immediately (before providers initialize)
-  const { reports, unresolvedVars, overriddenVars, nonScalarKeys, blockedCommandKeys } =
-    applyEnv(process.cwd());
+  const startup = applyEnv(process.cwd());
 
   // Register styled message renderer
   pi.registerMessageRenderer(MESSAGE_TYPE, (message) => {
@@ -232,10 +229,10 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("env", {
     description: "Show configured environment variables",
     handler: async (_args, ctx) => {
-      const { reports: currentReports } = applyEnv(ctx.cwd);
+      const { reports } = applyEnv(ctx.cwd);
       pi.sendMessage({
         customType: MESSAGE_TYPE,
-        content: formatReport(ctx.ui.theme, currentReports),
+        content: formatReport(ctx.ui.theme, reports),
         display: true,
       });
     },
@@ -245,27 +242,20 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
 
-    const warnings: string[] = [];
-    if (nonScalarKeys.length > 0) {
-      warnings.push(`${ctx.ui.theme.fg("warning", "ignoring non-scalar values:")} ${nonScalarKeys.join(", ")}`);
-    }
-    if (unresolvedVars.length > 0) {
-      warnings.push(`${ctx.ui.theme.fg("warning", "unresolved variables:")} ${[...new Set(unresolvedVars)].join(", ")}`);
-    }
-    if (overriddenVars.length > 0) {
-      warnings.push(`${ctx.ui.theme.fg("warning", "overriding existing variables:")} ${overriddenVars.join(", ")}`);
-    }
-    if (blockedCommandKeys.length > 0) {
-      warnings.push(
-        `${ctx.ui.theme.fg("warning", "blocked \"!command\" execution (project settings are untrusted):")} ${blockedCommandKeys.join(", ")}`
-      );
-    }
+    const warnings: Array<[string, string[]]> = [
+      ["ignoring non-scalar values:", startup.nonScalarKeys],
+      ["unresolved variables:", startup.unresolvedVars],
+      ["overriding existing variables:", startup.overriddenVars],
+      ['blocked "!command" execution (project settings are untrusted):', startup.blockedCommandKeys],
+    ];
+    const lines = warnings
+      .filter(([, keys]) => keys.length > 0)
+      .map(([label, keys]) => `  ${ctx.ui.theme.fg("warning", label)} ${keys.join(", ")}`);
 
-    if (warnings.length > 0) {
-      const text = ctx.ui.theme.fg("accent", "[env]") + "\n" + warnings.map((w) => `  ${w}`).join("\n");
+    if (lines.length > 0) {
       pi.sendMessage({
         customType: MESSAGE_TYPE,
-        content: text,
+        content: ctx.ui.theme.fg("accent", "[env]") + "\n" + lines.join("\n"),
         display: true,
       });
     }
