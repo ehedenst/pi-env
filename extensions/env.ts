@@ -53,10 +53,15 @@ const OVERRIDES_KEY = "_PI_EXT_ENV_OVERRIDES";
 const PROJECT_DENYLIST =
   /^(HOME|USERPROFILE|XDG_.*|PI_.*|.*_CODING_AGENT_DIR|EDITOR|VISUAL|GCE_METADATA_.*|AWS_(CONFIG_FILE|SHARED_CREDENTIALS_FILE)|GOOGLE_APPLICATION_CREDENTIALS|OPENSSL_(CONF|MODULES)|SSLKEYLOGFILE|GIT_ASKPASS|SSH_ASKPASS|PATH|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|LD_(PRELOAD|LIBRARY_PATH|AUDIT)|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELL|PERL5OPT|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|JAVA_TOOL_OPTIONS|GIT_(SSH_COMMAND|SSH|EXEC_PATH|CONFIG.*)|SSL_CERT_(FILE|DIR)|.*_PROXY|.*_BASE_URL|.*_ENDPOINT_URL.*|_PI_EXT_ENV_.*)$/i;
 
-// "!command" output is cached for the process lifetime, matching pi's own
-// resolver. Without this, load + session_start would run every command twice
-// and non-idempotent ones (e.g. `!openssl rand`) would yield different values.
-const commandCache = new Map<string, string>();
+// "!command" outcomes (success or failure) are cached for the process
+// lifetime, matching pi's own resolver. Without this, load + session_start
+// would run every command twice and non-idempotent ones (e.g. `!openssl rand`)
+// would yield different values. /reload re-evaluates the module and so resets it.
+interface CommandOutcome {
+  resolved?: string;
+  failed?: string;
+}
+const commandCache = new Map<string, CommandOutcome>();
 
 interface EnvReport {
   source: string;
@@ -74,34 +79,37 @@ interface EnvResult {
   deniedKeys: string[];
 }
 
-function interpolate(value: string, missing: string[]): string {
+// `hidden` keys read as unset: they hold values from a previous load that must
+// not feed into this one (see applyEnv).
+function interpolate(value: string, missing: string[], hidden: Set<string>): string {
   return value.replace(ENV_VAR_PATTERN, (match, braced, bare) => {
     if (match === "$$") return "$";
     if (match === "$!") return "!";
     const varName = braced ?? bare;
-    const resolved = process.env[varName];
+    const resolved = hidden.has(varName) ? undefined : process.env[varName];
     if (resolved === undefined) missing.push(varName);
     return resolved ?? "";
   });
 }
 
-// Runs one "!command". Resolves to { resolved } on success (cached for the
-// process lifetime) or { failed } with a short reason. Never rejects.
-async function runCommand(command: string): Promise<{ resolved?: string; failed?: string }> {
+// Runs one "!command" with an explicit environment. Resolves to { resolved }
+// on success or { failed } with a short reason. Never rejects.
+async function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<CommandOutcome> {
   const cached = commandCache.get(command);
-  if (cached !== undefined) return { resolved: cached };
+  if (cached) return cached;
+  let outcome: CommandOutcome;
   try {
-    const pending = execAsync(command, { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 });
+    const pending = execAsync(command, { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024, env });
     // No stdin: a command that prompts would otherwise hang until the timeout.
     pending.child.stdin?.end();
     const { stdout } = await pending;
-    const resolved = stdout.trim();
-    commandCache.set(command, resolved);
-    return { resolved };
+    outcome = { resolved: stdout.trim() };
   } catch (err) {
     // Report by key, not command: the interpolated command may contain secrets.
-    return { failed: failureReason(err) };
+    outcome = { failed: failureReason(err) };
   }
+  commandCache.set(command, outcome);
+  return outcome;
 }
 
 // Short, single-line, control-char-free reason for a failed "!command".
@@ -170,10 +178,12 @@ async function applyEnv(cwd: string, projectTrusted: boolean): Promise<EnvResult
       .filter((key) => process.env[key] !== undefined && !previousKeys.includes(key))
   );
 
-  // Remove everything we set on a previous load *before* resolving, so a
-  // project value from the last pass can never be interpolated into a global
-  // "!command" (shell injection) or a global $VAR reference on this pass.
-  for (const key of previousKeys) delete process.env[key];
+  // Keys we set on a previous load are hidden from interpolation and from
+  // command children until this pass re-applies them, so a project value from
+  // the last pass can never feed a global "!command" (shell injection) or a
+  // global $VAR reference. They stay in process.env meanwhile: deleting them up
+  // front left every command-derived key unset for the duration of the pass.
+  const hidden = new Set(previousKeys);
 
   const unresolvedVars: string[] = [];
   const nonScalarKeys: string[] = [];
@@ -187,17 +197,17 @@ async function applyEnv(cwd: string, projectTrusted: boolean): Promise<EnvResult
 
   const apply = (key: string, resolved: string, variables: Record<string, string>) => {
     process.env[key] = resolved;
+    hidden.delete(key);
     if (!appliedKeys.includes(key)) appliedKeys.push(key);
     variables[key] = resolved;
   };
 
-  // Phase 1: plain values apply synchronously, before any await, so other
-  // extensions' deferred work sees them at the same moment it does today.
-  // "!command" values are only collected here. Later sources override earlier
-  // ones, so project wins over global.
-  sources.forEach((source, i) => {
+  // Plain values apply synchronously, before any await, so other extensions'
+  // deferred work sees them at the same moment it did with the sync code.
+  // "!command" values are only collected. Later sources override earlier ones,
+  // so project wins over global.
+  const collect = (source: (typeof sources)[number], variables: Record<string, string>) => {
     if (!source.vars) return;
-    const variables = variablesBySource[i];
     for (const [key, value] of Object.entries(source.vars)) {
       if (!KEY_PATTERN.test(key)) {
         // Not identifier-shaped, so escape before it reaches the TUI/session file.
@@ -217,28 +227,33 @@ async function applyEnv(cwd: string, projectTrusted: boolean): Promise<EnvResult
       // The leading "!" must be literal in settings: it is checked before
       // interpolation so an interpolated value can never become a command.
       if (!raw.startsWith("!")) {
-        apply(key, interpolate(raw, missing), variables);
+        apply(key, interpolate(raw, missing, hidden), variables);
       } else if (!source.allowExec) {
         // Project settings ship inside repositories and are not a trusted
         // execution source. Leave the key untouched and warn.
         blockedCommandKeys.push(key);
       } else {
-        commands.push({ key, command: interpolate(raw.slice(1), missing), variables });
+        commands.push({ key, command: interpolate(raw.slice(1), missing, hidden), variables });
       }
       unresolvedVars.push(...missing);
     }
-  });
+  };
 
-  // Phase 2: run every global "!command" concurrently, deduplicated by command
-  // string so two keys sharing a command only spawn it once.
-  const runs = new Map<string, Promise<{ resolved?: string; failed?: string }>>();
+  // Phase 1: global values. Phase 2: spawn every global "!command" now, before
+  // any project value touches process.env, with previous-load keys stripped, so
+  // a project can never steer a global command through its environment (e.g.
+  // VAULT_ADDR). Deduplicated by command string. Phase 1b: project values.
+  collect(sources[0], variablesBySource[0]);
+  const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !hidden.has(key)));
+  const runs = new Map<string, Promise<CommandOutcome>>();
   for (const { command } of commands) {
-    if (!runs.has(command)) runs.set(command, runCommand(command));
+    if (!runs.has(command)) runs.set(command, runCommand(command, childEnv));
   }
+  collect(sources[1], variablesBySource[1]);
   await Promise.all(runs.values());
 
   // Phase 3: apply command results in settings order. A key a later source
-  // already set in phase 1 keeps that value (project wins over global).
+  // already set keeps that value (project wins over global).
   for (const { key, command, variables } of commands) {
     const outcome = await runs.get(command);
     if (!outcome) continue;
@@ -255,6 +270,11 @@ async function applyEnv(cwd: string, projectTrusted: boolean): Promise<EnvResult
   const reports: EnvReport[] = sources
     .map((source, i) => ({ source: source.name, variables: variablesBySource[i] }))
     .filter((report) => Object.keys(report.variables).length > 0);
+
+  // Keys removed from settings since the last load.
+  for (const key of previousKeys) {
+    if (!appliedKeys.includes(key)) delete process.env[key];
+  }
 
   const overriddenVars = appliedKeys.filter(
     (key) => preExisting.has(key) || previousOverrides.includes(key)
