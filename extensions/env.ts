@@ -9,6 +9,8 @@ import { Text } from "@earendil-works/pi-tui";
  *
  * Honors pi's settings hierarchy: project-level (.pi/settings.json)
  * overrides global (~/.pi/agent/settings.json). Both are merged.
+ * Global settings are applied at load; project settings only once pi
+ * has resolved project trust (session_start), never for untrusted repos.
  *
  * Supports $ENV_VAR and ${ENV_VAR} interpolation to reference
  * pre-existing environment variables, matching pi's own value
@@ -36,6 +38,11 @@ const CONFIG_KEY = "env";
 const MESSAGE_TYPE = "pi-env";
 const TRACKER_KEY = "_PI_EXT_ENV_KEYS";
 const OVERRIDES_KEY = "_PI_EXT_ENV_OVERRIDES";
+// Never settable from project scope: code loaders, shell startup hooks, and
+// network/TLS redirection give a repo code execution or credential exfil even
+// without "!command". Global settings are unaffected.
+const PROJECT_DENYLIST =
+  /^(PATH|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|LD_(PRELOAD|LIBRARY_PATH|AUDIT)|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELL|PERL5OPT|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|JAVA_TOOL_OPTIONS|GIT_(SSH_COMMAND|SSH|EXEC_PATH|CONFIG.*)|SSL_CERT_(FILE|DIR)|.*_PROXY|.*_BASE_URL|.*_ENDPOINT_URL.*|_PI_EXT_ENV_.*)$/i;
 
 interface EnvReport {
   source: string;
@@ -48,6 +55,8 @@ interface EnvResult {
   overriddenVars: string[];
   nonScalarKeys: string[];
   blockedCommandKeys: string[];
+  failedCommandKeys: string[];
+  deniedKeys: string[];
 }
 
 function interpolate(value: string, missing: string[]): string {
@@ -63,7 +72,7 @@ function interpolate(value: string, missing: string[]): string {
 function resolveValue(
   value: string,
   allowExec: boolean
-): { resolved: string; missing: string[]; blockedCommand?: string } {
+): { resolved: string; missing: string[]; blockedCommand?: string; failed?: boolean } {
   const missing: string[] = [];
 
   // The leading "!" must be literal in settings — it is checked before
@@ -87,8 +96,8 @@ function resolveValue(
     });
     return { resolved: output.trim(), missing };
   } catch {
-    missing.push(command);
-    return { resolved: "", missing };
+    // Report by key, not command: the interpolated command may contain secrets.
+    return { resolved: "", missing, failed: true };
   }
 }
 
@@ -117,8 +126,11 @@ function writeTracked(key: string, values: string[]): void {
   else delete process.env[key];
 }
 
-function applyEnv(cwd: string): EnvResult {
-  const settingsManager = SettingsManager.create(cwd);
+function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
+  // SettingsManager.create() defaults projectTrusted to true and would read
+  // .pi/settings.json before pi's own trust prompt. Pass the real decision so
+  // an untrusted repo cannot set PATH/NODE_OPTIONS/*_BASE_URL in this process.
+  const settingsManager = SettingsManager.create(cwd, undefined, { projectTrusted });
   const sources = [
     { name: "global", vars: extractEnv(settingsManager.getGlobalSettings()), allowExec: true },
     { name: "project", vars: extractEnv(settingsManager.getProjectSettings()), allowExec: false },
@@ -139,6 +151,8 @@ function applyEnv(cwd: string): EnvResult {
   const unresolvedVars: string[] = [];
   const nonScalarKeys: string[] = [];
   const blockedCommandKeys: string[] = [];
+  const failedCommandKeys: string[] = [];
+  const deniedKeys: string[] = [];
   const appliedKeys: string[] = [];
 
   // Later sources override earlier ones, so project wins over global.
@@ -150,8 +164,13 @@ function applyEnv(cwd: string): EnvResult {
         nonScalarKeys.push(key);
         continue;
       }
-      const { resolved, missing, blockedCommand } = resolveValue(String(value), source.allowExec);
+      if (!source.allowExec && PROJECT_DENYLIST.test(key)) {
+        deniedKeys.push(key);
+        continue;
+      }
+      const { resolved, missing, blockedCommand, failed } = resolveValue(String(value), source.allowExec);
       if (blockedCommand) blockedCommandKeys.push(key);
+      if (failed) failedCommandKeys.push(key);
       unresolvedVars.push(...missing);
       process.env[key] = resolved;
       if (!appliedKeys.includes(key)) appliedKeys.push(key);
@@ -181,7 +200,14 @@ function applyEnv(cwd: string): EnvResult {
     overriddenVars,
     nonScalarKeys: [...new Set(nonScalarKeys)],
     blockedCommandKeys,
+    failedCommandKeys,
+    deniedKeys,
   };
+}
+
+// Values may be secrets and /env output is persisted in the session file.
+function mask(value: string): string {
+  return value.length > 8 ? "••••" + value.slice(-4) : "•".repeat(value.length);
 }
 
 function formatReport(
@@ -196,15 +222,16 @@ function formatReport(
   for (const report of reports) {
     text += theme.fg("muted", `  ${report.source}`) + "\n";
     for (const [key, value] of Object.entries(report.variables)) {
-      text += `    ${theme.fg("success", key)}${theme.fg("dim", "=")}${theme.fg("muted", value)}\n`;
+      text += `    ${theme.fg("success", key)}${theme.fg("dim", "=")}${theme.fg("muted", mask(value))}\n`;
     }
   }
   return text.trimEnd();
 }
 
 export default function (pi: ExtensionAPI): void {
-  // Apply env vars immediately (before providers initialize)
-  const startup = applyEnv(process.cwd());
+  // Apply global env vars immediately (before providers initialize). Project
+  // settings are applied in session_start, once pi has resolved project trust.
+  let startup = applyEnv(process.cwd(), false);
 
   // Register styled message renderer
   pi.registerMessageRenderer(MESSAGE_TYPE, (message) => {
@@ -229,7 +256,7 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("env", {
     description: "Show configured environment variables",
     handler: async (_args, ctx) => {
-      const { reports } = applyEnv(ctx.cwd);
+      const { reports } = applyEnv(ctx.cwd, ctx.isProjectTrusted());
       pi.sendMessage({
         customType: MESSAGE_TYPE,
         content: formatReport(ctx.ui.theme, reports),
@@ -240,6 +267,8 @@ export default function (pi: ExtensionAPI): void {
 
   // Show warnings on session start (no values — may contain secrets)
   pi.on("session_start", async (_event, ctx) => {
+    // ponytail: re-runs global "!command"s once more when the project is trusted
+    if (ctx.isProjectTrusted()) startup = applyEnv(ctx.cwd, true);
     if (!ctx.hasUI) return;
 
     const warnings: Array<[string, string[]]> = [
@@ -247,6 +276,8 @@ export default function (pi: ExtensionAPI): void {
       ["unresolved variables:", startup.unresolvedVars],
       ["overriding existing variables:", startup.overriddenVars],
       ['blocked "!command" execution (project settings are untrusted):', startup.blockedCommandKeys],
+      ['"!command" failed (set to empty):', startup.failedCommandKeys],
+      ["refused from project settings (loader/network variable):", startup.deniedKeys],
     ];
     const lines = warnings
       .filter(([, keys]) => keys.length > 0)

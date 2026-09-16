@@ -56,7 +56,11 @@ Reference pre-existing environment variables using pi's value resolution syntax:
 | `$$` | Literal `$` character |
 | `literal` | Used as-is |
 
-**`!ENV_CMD` is only honored in global settings** (`~/.pi/agent/settings.json`). Project settings (`.pi/settings.json`) ship inside repositories, so a `!command` value there is not trusted or executed — it is reported as a blocked warning instead. This prevents a malicious or compromised repo from getting arbitrary command execution just by being cloned and opened.
+**`!ENV_CMD` is only honored in global settings** (`~/.pi/agent/settings.json`). Project settings (`.pi/settings.json`) ship inside repositories, so a `!command` value there is not trusted or executed — it is reported as a blocked warning instead.
+
+Project settings are only applied after pi's [project trust](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/security.md) prompt has been accepted for the folder. Until then only global settings are applied, so a cloned repo cannot set variables like `PATH`, `NODE_OPTIONS`, or `ANTHROPIC_BASE_URL` in the agent process before you approve it.
+
+Even in a trusted project, project settings may not set loader, shell-startup, or network-redirect variables (`PATH`, `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`, `GIT_SSH_COMMAND`, `*_PROXY`, `*_BASE_URL`, `*_ENDPOINT_URL*`, TLS overrides, and a few more). They are skipped and reported as refused. Put those in global settings instead.
 
 ```json
 {
@@ -82,7 +86,7 @@ If both define `env`, the project values override global values for the same key
 
 - **Scalar coercion** — numbers and booleans are coerced to strings via `String()`
 - **Stale cleanup** — variables removed from settings are unset on `/reload`
-- **`/env` command** — print currently configured env vars in the TUI at any time
+- **`/env` command** — print currently configured env var names in the TUI at any time (values are masked, since the output is persisted in the session file)
 - **Styled output** — shows a summary of applied variables on session start
 - **Warnings** — notifies in the TUI for unresolved variables, non-scalar values, overridden existing env vars, or blocked `!command` execution from project settings
 
