@@ -43,7 +43,12 @@ const OVERRIDES_KEY = "_PI_EXT_ENV_OVERRIDES";
 // network/TLS redirection give a repo code execution or credential exfil even
 // without "!command". Global settings are unaffected.
 const PROJECT_DENYLIST =
-  /^(HOME|USERPROFILE|XDG_.*|.*_CODING_AGENT_DIR|PATH|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|LD_(PRELOAD|LIBRARY_PATH|AUDIT)|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELL|PERL5OPT|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|JAVA_TOOL_OPTIONS|GIT_(SSH_COMMAND|SSH|EXEC_PATH|CONFIG.*)|SSL_CERT_(FILE|DIR)|.*_PROXY|.*_BASE_URL|.*_ENDPOINT_URL.*|_PI_EXT_ENV_.*)$/i;
+  /^(HOME|USERPROFILE|XDG_.*|PI_.*|.*_CODING_AGENT_DIR|EDITOR|VISUAL|GCE_METADATA_.*|AWS_(CONFIG_FILE|SHARED_CREDENTIALS_FILE)|GOOGLE_APPLICATION_CREDENTIALS|OPENSSL_(CONF|MODULES)|SSLKEYLOGFILE|GIT_ASKPASS|SSH_ASKPASS|PATH|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|LD_(PRELOAD|LIBRARY_PATH|AUDIT)|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELL|PERL5OPT|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|JAVA_TOOL_OPTIONS|GIT_(SSH_COMMAND|SSH|EXEC_PATH|CONFIG.*)|SSL_CERT_(FILE|DIR)|.*_PROXY|.*_BASE_URL|.*_ENDPOINT_URL.*|_PI_EXT_ENV_.*)$/i;
+
+// "!command" output is cached for the process lifetime, matching pi's own
+// resolver. Without this, load + session_start would run every command twice
+// and non-idempotent ones (e.g. `!openssl rand`) would yield different values.
+const commandCache = new Map<string, string>();
 
 interface EnvReport {
   source: string;
@@ -92,6 +97,9 @@ function resolveValue(
   // rather than clobbering a working credential with an empty string.
   if (!allowExec) return { missing, blockedCommand: command };
 
+  const cached = commandCache.get(command);
+  if (cached !== undefined) return { resolved: cached, missing };
+
   try {
     const output = execSync(command, {
       encoding: 'utf8',
@@ -100,7 +108,9 @@ function resolveValue(
       // No stdin: a command that prompts would otherwise hang the TUI until timeout.
       stdio: ["ignore", "pipe", "pipe"],
     });
-    return { resolved: output.trim(), missing };
+    const resolved = output.trim();
+    commandCache.set(command, resolved);
+    return { resolved, missing };
   } catch {
     // Report by key, not command: the interpolated command may contain secrets.
     return { missing, failed: true };
@@ -179,7 +189,8 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
     const variables: Record<string, string> = {};
     for (const [key, value] of Object.entries(source.vars)) {
       if (!KEY_PATTERN.test(key)) {
-        invalidKeys.push(key);
+        // Not identifier-shaped, so escape before it reaches the TUI/session file.
+        invalidKeys.push(JSON.stringify(key));
         continue;
       }
       if (!isScalar(value)) {
@@ -270,14 +281,14 @@ export default function (pi: ExtensionAPI): void {
     ),
   }));
 
-  // Register /env command
+  // Register /env command. Read-only: shows the last applied state instead of
+  // re-running "!command"s and re-mutating the environment. /reload re-applies.
   pi.registerCommand("env", {
     description: "Show configured environment variables",
     handler: async (_args, ctx) => {
-      const { reports } = applyEnv(ctx.cwd, ctx.isProjectTrusted());
       pi.sendMessage({
         customType: MESSAGE_TYPE,
-        content: formatReport(ctx.ui.theme, reports),
+        content: formatReport(ctx.ui.theme, startup.reports),
         display: true,
       });
     },

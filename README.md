@@ -60,7 +60,11 @@ Reference pre-existing environment variables using pi's value resolution syntax:
 
 Project settings are only applied after pi's [project trust](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/security.md) prompt has been accepted for the folder. Until then only global settings are applied, so a cloned repo cannot set variables like `PATH`, `NODE_OPTIONS`, or `ANTHROPIC_BASE_URL` in the agent process before you approve it.
 
-Even in a trusted project, project settings may not set loader, shell-startup, or network-redirect variables (`PATH`, `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`, `GIT_SSH_COMMAND`, `*_PROXY`, `*_BASE_URL`, `*_ENDPOINT_URL*`, TLS overrides, and a few more). They are skipped and reported as refused. Put those in global settings instead. This list is defense in depth, not a boundary: a trusted project in pi can already install extensions, so the trust prompt is what actually protects you.
+Even in a trusted project, project settings may not set loader, shell-startup, editor, pi-internal, or network-redirect variables (`PATH`, `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`, `EDITOR`/`VISUAL`, `PI_*`, `HOME`, `GIT_SSH_COMMAND`, `*_PROXY`, `*_BASE_URL`, `*_ENDPOINT_URL*`, cloud credential-file pointers, TLS overrides, and a few more). They are skipped and reported as refused. Put those in global settings instead.
+
+This list is defense in depth, not a boundary: a trusted project in pi can already install extensions, so the trust prompt is what actually protects you. In particular, a project can still set credential *values* such as `AWS_ACCESS_KEY_ID` or any `*_API_KEY`. Pointing those at an account you do not control sends your prompts to that account's provider logs. Only trust projects whose `.pi/settings.json` you have read.
+
+`!command` output is cached for the lifetime of the pi process, matching pi's own config resolution.
 
 ```json
 {
@@ -86,7 +90,7 @@ If both define `env`, the project values override global values for the same key
 
 - **Scalar coercion** — numbers and booleans are coerced to strings via `String()`
 - **Stale cleanup** — variables removed from settings are unset on `/reload`
-- **`/env` command** — print currently configured env var names in the TUI at any time (values are masked, since the output is persisted in the session file)
+- **`/env` command** — print the env vars applied on the last load (values are masked, since the output is persisted in the session file). Read-only; use `/reload` to re-apply after editing settings
 - **Styled output** — shows a summary of applied variables on session start
 - **Warnings** — notifies in the TUI for unresolved variables, non-scalar values, overridden existing env vars, or blocked `!command` execution from project settings
 
