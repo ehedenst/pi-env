@@ -62,6 +62,7 @@ interface CommandOutcome {
   failed?: string;
 }
 const commandCache = new Map<string, CommandOutcome>();
+const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 interface EnvReport {
   source: string;
@@ -99,7 +100,8 @@ async function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<Comm
   if (cached) return cached;
   let outcome: CommandOutcome;
   try {
-    const pending = execAsync(command, { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024, env });
+    // 10s timeout and 1 MB cap match pi's own config value resolver.
+    const pending = execAsync(command, { encoding: "utf8", timeout: 10000, maxBuffer: MAX_OUTPUT_BYTES, env });
     // No stdin: a command that prompts would otherwise hang until the timeout.
     pending.child.stdin?.end();
     const { stdout } = await pending;
@@ -114,10 +116,13 @@ async function runCommand(command: string, env: NodeJS.ProcessEnv): Promise<Comm
 
 // Short, single-line, control-char-free reason for a failed "!command".
 function failureReason(err: unknown): string {
-  const e = err as { code?: string | number; signal?: string | null; stderr?: string | Buffer };
+  const e = err as { code?: string | number; killed?: boolean; signal?: string | null; stderr?: string | Buffer };
   // exec() puts the exit status in `code` (number) and spawn errors as a string.
+  // `killed` is set only when exec itself killed the child (timeout / maxBuffer).
   let head = typeof e.code === "string" ? e.code : "error";
-  if (e.signal) head = "timed out";
+  if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") head = `output exceeded ${MAX_OUTPUT_BYTES / 1024 / 1024} MB`;
+  else if (e.killed) head = "timed out";
+  else if (e.signal) head = `killed by ${e.signal}`;
   else if (typeof e.code === "number") head = `exit ${e.code}`;
   const stderr = String(e.stderr ?? "")
     .split("\n")[0]
