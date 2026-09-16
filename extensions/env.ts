@@ -1,4 +1,5 @@
-import { execSync } from 'node:child_process';
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -32,7 +33,13 @@ import { Text } from "@earendil-works/pi-tui";
  * Values may be strings, numbers, or booleans. Non-string
  * scalars are coerced via String(). Objects/arrays are ignored
  * with a warning.
+ *
+ * All "!command" values run in parallel, so startup waits for the slowest
+ * one rather than the sum. Consequence: a command may reference variables
+ * from the shell environment, but not keys defined in the same "env" block.
  */
+
+const execAsync = promisify(exec);
 
 const ENV_VAR_PATTERN = /\$\$|\$!|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
 const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -78,53 +85,32 @@ function interpolate(value: string, missing: string[]): string {
   });
 }
 
-function resolveValue(
-  value: string,
-  allowExec: boolean
-): { resolved?: string; missing: string[]; blockedCommand?: string; failed?: string } {
-  const missing: string[] = [];
-
-  // The leading "!" must be literal in settings — it is checked before
-  // interpolation so an interpolated env var value can never become a command.
-  if (!value.startsWith("!")) {
-    return { resolved: interpolate(value, missing), missing };
-  }
-
-  // "!command" execution is only trusted from global settings
-  // (~/.pi/agent/settings.json). Project settings (.pi/settings.json) ship
-  // inside repositories and are not a trusted execution source, so refuse to
-  // run the command and surface it as a warning instead.
-  const command = interpolate(value.slice(1), missing);
-  // No `resolved` on block/failure: leave whatever the shell provided intact
-  // rather than clobbering a working credential with an empty string.
-  if (!allowExec) return { missing, blockedCommand: command };
-
+// Runs one "!command". Resolves to { resolved } on success (cached for the
+// process lifetime) or { failed } with a short reason. Never rejects.
+async function runCommand(command: string): Promise<{ resolved?: string; failed?: string }> {
   const cached = commandCache.get(command);
-  if (cached !== undefined) return { resolved: cached, missing };
-
+  if (cached !== undefined) return { resolved: cached };
   try {
-    const output = execSync(command, {
-      encoding: 'utf8',
-      timeout: 5000,
-      maxBuffer: 1024 * 1024,
-      // No stdin: a command that prompts would otherwise hang the TUI until timeout.
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const resolved = output.trim();
+    const pending = execAsync(command, { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 });
+    // No stdin: a command that prompts would otherwise hang until the timeout.
+    pending.child.stdin?.end();
+    const { stdout } = await pending;
+    const resolved = stdout.trim();
     commandCache.set(command, resolved);
-    return { resolved, missing };
+    return { resolved };
   } catch (err) {
     // Report by key, not command: the interpolated command may contain secrets.
-    return { missing, failed: failureReason(err) };
+    return { failed: failureReason(err) };
   }
 }
 
 // Short, single-line, control-char-free reason for a failed "!command".
 function failureReason(err: unknown): string {
-  const e = err as { code?: string; signal?: string | null; status?: number | null; stderr?: string | Buffer };
-  let head = e.code ?? "error";
-  if (e.code === "ETIMEDOUT" || e.signal) head = "timed out";
-  else if (e.status != null) head = `exit ${e.status}`;
+  const e = err as { code?: string | number; signal?: string | null; stderr?: string | Buffer };
+  // exec() puts the exit status in `code` (number) and spawn errors as a string.
+  let head = typeof e.code === "string" ? e.code : "error";
+  if (e.signal) head = "timed out";
+  else if (typeof e.code === "number") head = `exit ${e.code}`;
   const stderr = String(e.stderr ?? "")
     .split("\n")[0]
     .replace(/[\u0000-\u001f\u007f]/g, "")
@@ -163,7 +149,7 @@ function writeTracked(key: string, values: string[]): void {
 // redirect the "global" scope, which is allowed to run "!command".
 const AGENT_DIR = getAgentDir();
 
-function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
+async function applyEnv(cwd: string, projectTrusted: boolean): Promise<EnvResult> {
   // SettingsManager.create() defaults projectTrusted to true and would read
   // .pi/settings.json before pi's own trust prompt. Pass the real decision so
   // an untrusted repo cannot set PATH/NODE_OPTIONS/*_BASE_URL in this process.
@@ -189,7 +175,6 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
   // "!command" (shell injection) or a global $VAR reference on this pass.
   for (const key of previousKeys) delete process.env[key];
 
-  const reports: EnvReport[] = [];
   const unresolvedVars: string[] = [];
   const nonScalarKeys: string[] = [];
   const invalidKeys: string[] = [];
@@ -197,11 +182,22 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
   const failedCommandKeys: string[] = [];
   const deniedKeys: string[] = [];
   const appliedKeys: string[] = [];
+  const variablesBySource = sources.map(() => ({} as Record<string, string>));
+  const commands: Array<{ key: string; command: string; variables: Record<string, string> }> = [];
 
-  // Later sources override earlier ones, so project wins over global.
-  for (const source of sources) {
-    if (!source.vars) continue;
-    const variables: Record<string, string> = {};
+  const apply = (key: string, resolved: string, variables: Record<string, string>) => {
+    process.env[key] = resolved;
+    if (!appliedKeys.includes(key)) appliedKeys.push(key);
+    variables[key] = resolved;
+  };
+
+  // Phase 1: plain values apply synchronously, before any await, so other
+  // extensions' deferred work sees them at the same moment it does today.
+  // "!command" values are only collected here. Later sources override earlier
+  // ones, so project wins over global.
+  sources.forEach((source, i) => {
+    if (!source.vars) return;
+    const variables = variablesBySource[i];
     for (const [key, value] of Object.entries(source.vars)) {
       if (!KEY_PATTERN.test(key)) {
         // Not identifier-shaped, so escape before it reaches the TUI/session file.
@@ -216,19 +212,47 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
         deniedKeys.push(key);
         continue;
       }
-      const { resolved, missing, blockedCommand, failed } = resolveValue(String(value), source.allowExec);
-      if (blockedCommand) blockedCommandKeys.push(key);
-      if (failed) failedCommandKeys.push(`${key} (${failed})`);
+      const raw = String(value);
+      const missing: string[] = [];
+      // The leading "!" must be literal in settings: it is checked before
+      // interpolation so an interpolated value can never become a command.
+      if (!raw.startsWith("!")) {
+        apply(key, interpolate(raw, missing), variables);
+      } else if (!source.allowExec) {
+        // Project settings ship inside repositories and are not a trusted
+        // execution source. Leave the key untouched and warn.
+        blockedCommandKeys.push(key);
+      } else {
+        commands.push({ key, command: interpolate(raw.slice(1), missing), variables });
+      }
       unresolvedVars.push(...missing);
-      if (resolved === undefined) continue;
-      process.env[key] = resolved;
-      if (!appliedKeys.includes(key)) appliedKeys.push(key);
-      variables[key] = resolved;
     }
-    if (Object.keys(variables).length > 0) {
-      reports.push({ source: source.name, variables });
-    }
+  });
+
+  // Phase 2: run every global "!command" concurrently, deduplicated by command
+  // string so two keys sharing a command only spawn it once.
+  const runs = new Map<string, Promise<{ resolved?: string; failed?: string }>>();
+  for (const { command } of commands) {
+    if (!runs.has(command)) runs.set(command, runCommand(command));
   }
+  await Promise.all(runs.values());
+
+  // Phase 3: apply command results in settings order. A key a later source
+  // already set in phase 1 keeps that value (project wins over global).
+  for (const { key, command, variables } of commands) {
+    const { resolved, failed } = await runs.get(command)!;
+    if (failed) {
+      failedCommandKeys.push(`${key} (${failed})`);
+      continue;
+    }
+    if (resolved === undefined) continue;
+    variables[key] = resolved;
+    if (!appliedKeys.includes(key)) apply(key, resolved, variables);
+  }
+
+  const reports: EnvReport[] = sources
+    .map((source, i) => ({ source: source.name, variables: variablesBySource[i] }))
+    .filter((report) => Object.keys(report.variables).length > 0);
 
   const overriddenVars = appliedKeys.filter(
     (key) => preExisting.has(key) || previousOverrides.includes(key)
@@ -273,10 +297,12 @@ function formatReport(
   return text.trimEnd();
 }
 
-export default function (pi: ExtensionAPI): void {
+// Async so "!command"s can run in parallel; pi awaits the factory before
+// loading the next extension, so later extensions still see the final env.
+export default async function (pi: ExtensionAPI): Promise<void> {
   // Apply global env vars immediately (before providers initialize). Project
   // settings are applied in session_start, once pi has resolved project trust.
-  let startup = applyEnv(process.cwd(), false);
+  let startup = await applyEnv(process.cwd(), false);
 
   // Register styled message renderer
   pi.registerMessageRenderer(MESSAGE_TYPE, (message) => {
@@ -311,8 +337,8 @@ export default function (pi: ExtensionAPI): void {
 
   // Show warnings on session start (no values — may contain secrets)
   pi.on("session_start", async (_event, ctx) => {
-    // ponytail: re-runs global "!command"s once more when the project is trusted
-    if (ctx.isProjectTrusted()) startup = applyEnv(ctx.cwd, true);
+    // Second pass adds project values; global "!command"s hit the cache.
+    if (ctx.isProjectTrusted()) startup = await applyEnv(ctx.cwd, true);
     // Headless (-p, json, rpc): no theme, so fall back to plain stderr.
     const fg = ctx.hasUI ? ctx.ui.theme.fg.bind(ctx.ui.theme) : (_c: string, t: string) => t;
 

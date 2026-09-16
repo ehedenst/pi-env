@@ -65,6 +65,8 @@ Even in a trusted project, project settings may not set loader, shell-startup, e
 
 This list is defense in depth, not a boundary: a trusted project in pi can already install extensions, so the trust prompt is what actually protects you. In particular, a project can still set credential *values* such as `AWS_ACCESS_KEY_ID` or any `*_API_KEY`. Pointing those at an account you do not control sends your prompts to that account's provider logs. Only trust projects whose `.pi/settings.json` you have read.
 
+All `!command` values run **in parallel**, so startup waits for the slowest command rather than the sum of all of them. Identical command strings are only run once. The trade-off: a `!command` may reference variables from your shell environment, but **not other keys defined in the same `env` block**, because none of them have been set yet when the commands start. Plain values and `$VAR` references are applied before any command runs.
+
 `!command` output is cached for the lifetime of the pi process, matching pi's own config resolution.
 
 ```json
