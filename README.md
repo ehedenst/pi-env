@@ -54,6 +54,7 @@ Reference pre-existing environment variables using pi's value resolution syntax:
 | `${ENV_VAR}` | Same, braced form (useful when followed by text) |
 | `!ENV_CMD` | Output of `ENV_CMD` when executed in the shell environment (global settings only, see below) |
 | `$$` | Literal `$` character |
+| `$!` | Literal `!` character (lets a value start with `!` without running it as a command) |
 | `literal` | Used as-is |
 
 **`!ENV_CMD` is only honored in global settings** (`~/.pi/agent/settings.json`). Project settings (`.pi/settings.json`) ship inside repositories, so a `!command` value there is not trusted or executed — it is reported as a blocked warning instead.

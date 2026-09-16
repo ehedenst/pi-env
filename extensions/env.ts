@@ -14,7 +14,8 @@ import { Text } from "@earendil-works/pi-tui";
  *
  * Supports $ENV_VAR and ${ENV_VAR} interpolation to reference
  * pre-existing environment variables, matching pi's own value
- * resolution syntax. $$ escapes to a literal $.
+ * resolution syntax. $$ escapes to a literal $, $! to a literal !
+ * (so a value may start with "!" without being run as a command).
  *
  * Example settings.json:
  * {
@@ -33,7 +34,7 @@ import { Text } from "@earendil-works/pi-tui";
  * with a warning.
  */
 
-const ENV_VAR_PATTERN = /\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
+const ENV_VAR_PATTERN = /\$\$|\$!|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
 const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONFIG_KEY = "env";
 const MESSAGE_TYPE = "pi-env";
@@ -69,6 +70,7 @@ interface EnvResult {
 function interpolate(value: string, missing: string[]): string {
   return value.replace(ENV_VAR_PATTERN, (match, braced, bare) => {
     if (match === "$$") return "$";
+    if (match === "$!") return "!";
     const varName = braced ?? bare;
     const resolved = process.env[varName];
     if (resolved === undefined) missing.push(varName);
