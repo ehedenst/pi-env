@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SettingsManager } from "@earendil-works/pi-coding-agent";
+import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 /**
@@ -42,7 +42,7 @@ const OVERRIDES_KEY = "_PI_EXT_ENV_OVERRIDES";
 // network/TLS redirection give a repo code execution or credential exfil even
 // without "!command". Global settings are unaffected.
 const PROJECT_DENYLIST =
-  /^(PATH|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|LD_(PRELOAD|LIBRARY_PATH|AUDIT)|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELL|PERL5OPT|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|JAVA_TOOL_OPTIONS|GIT_(SSH_COMMAND|SSH|EXEC_PATH|CONFIG.*)|SSL_CERT_(FILE|DIR)|.*_PROXY|.*_BASE_URL|.*_ENDPOINT_URL.*|_PI_EXT_ENV_.*)$/i;
+  /^(HOME|USERPROFILE|XDG_.*|.*_CODING_AGENT_DIR|PATH|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|LD_(PRELOAD|LIBRARY_PATH|AUDIT)|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELL|PERL5OPT|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|JAVA_TOOL_OPTIONS|GIT_(SSH_COMMAND|SSH|EXEC_PATH|CONFIG.*)|SSL_CERT_(FILE|DIR)|.*_PROXY|.*_BASE_URL|.*_ENDPOINT_URL.*|_PI_EXT_ENV_.*)$/i;
 
 interface EnvReport {
   source: string;
@@ -126,11 +126,16 @@ function writeTracked(key: string, values: string[]): void {
   else delete process.env[key];
 }
 
+// Resolved once at load, before any settings are applied. Later calls must not
+// re-derive it from process.env (HOME, PI_CODING_AGENT_DIR), or a project could
+// redirect the "global" scope, which is allowed to run "!command".
+const AGENT_DIR = getAgentDir();
+
 function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
   // SettingsManager.create() defaults projectTrusted to true and would read
   // .pi/settings.json before pi's own trust prompt. Pass the real decision so
   // an untrusted repo cannot set PATH/NODE_OPTIONS/*_BASE_URL in this process.
-  const settingsManager = SettingsManager.create(cwd, undefined, { projectTrusted });
+  const settingsManager = SettingsManager.create(cwd, AGENT_DIR, { projectTrusted });
   const sources = [
     { name: "global", vars: extractEnv(settingsManager.getGlobalSettings()), allowExec: true },
     { name: "project", vars: extractEnv(settingsManager.getProjectSettings()), allowExec: false },
@@ -146,6 +151,11 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
       .flatMap((source) => Object.keys(source.vars ?? {}))
       .filter((key) => process.env[key] !== undefined && !previousKeys.includes(key))
   );
+
+  // Remove everything we set on a previous load *before* resolving, so a
+  // project value from the last pass can never be interpolated into a global
+  // "!command" (shell injection) or a global $VAR reference on this pass.
+  for (const key of previousKeys) delete process.env[key];
 
   const reports: EnvReport[] = [];
   const unresolvedVars: string[] = [];
@@ -179,11 +189,6 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
     if (Object.keys(variables).length > 0) {
       reports.push({ source: source.name, variables });
     }
-  }
-
-  // Clean up stale vars from a previous load (e.g. after /reload with keys removed)
-  for (const key of previousKeys) {
-    if (!appliedKeys.includes(key)) delete process.env[key];
   }
 
   const overriddenVars = appliedKeys.filter(

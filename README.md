@@ -60,7 +60,7 @@ Reference pre-existing environment variables using pi's value resolution syntax:
 
 Project settings are only applied after pi's [project trust](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/security.md) prompt has been accepted for the folder. Until then only global settings are applied, so a cloned repo cannot set variables like `PATH`, `NODE_OPTIONS`, or `ANTHROPIC_BASE_URL` in the agent process before you approve it.
 
-Even in a trusted project, project settings may not set loader, shell-startup, or network-redirect variables (`PATH`, `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`, `GIT_SSH_COMMAND`, `*_PROXY`, `*_BASE_URL`, `*_ENDPOINT_URL*`, TLS overrides, and a few more). They are skipped and reported as refused. Put those in global settings instead.
+Even in a trusted project, project settings may not set loader, shell-startup, or network-redirect variables (`PATH`, `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`, `GIT_SSH_COMMAND`, `*_PROXY`, `*_BASE_URL`, `*_ENDPOINT_URL*`, TLS overrides, and a few more). They are skipped and reported as refused. Put those in global settings instead. This list is defense in depth, not a boundary: a trusted project in pi can already install extensions, so the trust prompt is what actually protects you.
 
 ```json
 {
