@@ -52,9 +52,11 @@ Reference pre-existing environment variables using pi's value resolution syntax:
 |--------|---------|
 | `$ENV_VAR` | Value of `ENV_VAR` from the shell environment |
 | `${ENV_VAR}` | Same, braced form (useful when followed by text) |
-| `!ENV_CMD` | Output of `ENV_CMD` when executed in the shell environment |
+| `!ENV_CMD` | Output of `ENV_CMD` when executed in the shell environment (global settings only, see below) |
 | `$$` | Literal `$` character |
 | `literal` | Used as-is |
+
+**`!ENV_CMD` is only honored in global settings** (`~/.pi/agent/settings.json`). Project settings (`.pi/settings.json`) ship inside repositories, so a `!command` value there is not trusted or executed — it is reported as a blocked warning instead. This prevents a malicious or compromised repo from getting arbitrary command execution just by being cloned and opened.
 
 ```json
 {
@@ -82,7 +84,7 @@ If both define `env`, the project values override global values for the same key
 - **Stale cleanup** — variables removed from settings are unset on `/reload`
 - **`/env` command** — print currently configured env vars in the TUI at any time
 - **Styled output** — shows a summary of applied variables on session start
-- **Warnings** — notifies in the TUI for unresolved variables, non-scalar values, or overridden existing env vars
+- **Warnings** — notifies in the TUI for unresolved variables, non-scalar values, overridden existing env vars, or blocked `!command` execution from project settings
 
 ## Why not just export in .zshrc?
 

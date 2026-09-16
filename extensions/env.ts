@@ -42,7 +42,10 @@ interface EnvReport {
   variables: Record<string, string>;
 }
 
-function resolveValue(value: string): { resolved: string; missing: string[] } {
+function resolveValue(
+  value: string,
+  allowExec: boolean
+): { resolved: string; missing: string[]; blockedCommand?: string } {
   const missing: string[] = [];
   let resolved = value.replace(ENV_VAR_PATTERN, (match, braced, bare) => {
     if (match === "$$") return "$";
@@ -52,10 +55,22 @@ function resolveValue(value: string): { resolved: string; missing: string[] } {
     return val ?? "";
   });
   if (resolved.startsWith('!')) {
+    const command = resolved.slice(1);
+    if (!allowExec) {
+      // "!command" execution is only trusted from global settings
+      // (~/.pi/agent/settings.json). Project settings (.pi/settings.json)
+      // ship inside repositories and are not a trusted execution source,
+      // so refuse to run the command and surface it as a warning instead.
+      return { resolved: "", missing, blockedCommand: command };
+    }
     try {
-      resolved = execSync(resolved.slice(1), { encoding: 'utf8' }).trim();
+      resolved = execSync(command, {
+        encoding: 'utf8',
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      }).trim();
     } catch (error) {
-      missing.push(resolved.slice(1));
+      missing.push(command);
     }
   }
   return { resolved, missing };
@@ -76,6 +91,7 @@ function applyEnv(cwd: string): {
   unresolvedVars: string[];
   overriddenVars: string[];
   nonScalarKeys: string[];
+  blockedCommandKeys: string[];
 } {
   const settingsManager = SettingsManager.create(cwd);
   const globalEnvRaw = extractEnv(settingsManager.getGlobalSettings());
@@ -101,15 +117,17 @@ function applyEnv(cwd: string): {
 
   const unresolvedVars: string[] = [];
   const overriddenVars: string[] = [];
+  const blockedCommandKeys: string[] = [];
   const reports: EnvReport[] = [];
 
-  // Process global
+  // Process global (trusted source: "!command" execution is allowed)
   if (globalEnvRaw) {
     const vars: Record<string, string> = {};
     for (const [key, value] of Object.entries(globalEnvRaw)) {
       if (!isScalar(value)) continue;
       const strValue = String(value);
-      const { resolved, missing } = resolveValue(strValue);
+      const { resolved, missing, blockedCommand } = resolveValue(strValue, true);
+      if (blockedCommand) blockedCommandKeys.push(key);
       unresolvedVars.push(...missing);
       if (
         (process.env[key] !== undefined && !previousKeys.includes(key)) ||
@@ -125,13 +143,16 @@ function applyEnv(cwd: string): {
     }
   }
 
-  // Process project (overrides global)
+  // Process project (overrides global). Project settings ship inside
+  // repositories and are not a trusted execution source, so "!command"
+  // values are refused here (see resolveValue's allowExec=false).
   if (projectEnvRaw) {
     const vars: Record<string, string> = {};
     for (const [key, value] of Object.entries(projectEnvRaw)) {
       if (!isScalar(value)) continue;
       const strValue = String(value);
-      const { resolved, missing } = resolveValue(strValue);
+      const { resolved, missing, blockedCommand } = resolveValue(strValue, false);
+      if (blockedCommand) blockedCommandKeys.push(key);
       unresolvedVars.push(...missing);
       if (
         (process.env[key] !== undefined &&
@@ -162,7 +183,7 @@ function applyEnv(cwd: string): {
     delete process.env[OVERRIDES_KEY];
   }
 
-  return { reports, unresolvedVars, overriddenVars, nonScalarKeys };
+  return { reports, unresolvedVars, overriddenVars, nonScalarKeys, blockedCommandKeys };
 }
 
 function formatReport(
@@ -185,7 +206,8 @@ function formatReport(
 
 export default function (pi: ExtensionAPI): void {
   // Apply env vars immediately (before providers initialize)
-  const { reports, unresolvedVars, overriddenVars, nonScalarKeys } = applyEnv(process.cwd());
+  const { reports, unresolvedVars, overriddenVars, nonScalarKeys, blockedCommandKeys } =
+    applyEnv(process.cwd());
 
   // Register styled message renderer
   pi.registerMessageRenderer(MESSAGE_TYPE, (message) => {
@@ -232,6 +254,11 @@ export default function (pi: ExtensionAPI): void {
     }
     if (overriddenVars.length > 0) {
       warnings.push(`${ctx.ui.theme.fg("warning", "overriding existing variables:")} ${overriddenVars.join(", ")}`);
+    }
+    if (blockedCommandKeys.length > 0) {
+      warnings.push(
+        `${ctx.ui.theme.fg("warning", "blocked \"!command\" execution (project settings are untrusted):")} ${blockedCommandKeys.join(", ")}`
+      );
     }
 
     if (warnings.length > 0) {
