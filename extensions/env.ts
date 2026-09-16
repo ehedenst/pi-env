@@ -34,6 +34,7 @@ import { Text } from "@earendil-works/pi-tui";
  */
 
 const ENV_VAR_PATTERN = /\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
+const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONFIG_KEY = "env";
 const MESSAGE_TYPE = "pi-env";
 const TRACKER_KEY = "_PI_EXT_ENV_KEYS";
@@ -54,6 +55,7 @@ interface EnvResult {
   unresolvedVars: string[];
   overriddenVars: string[];
   nonScalarKeys: string[];
+  invalidKeys: string[];
   blockedCommandKeys: string[];
   failedCommandKeys: string[];
   deniedKeys: string[];
@@ -72,7 +74,7 @@ function interpolate(value: string, missing: string[]): string {
 function resolveValue(
   value: string,
   allowExec: boolean
-): { resolved: string; missing: string[]; blockedCommand?: string; failed?: boolean } {
+): { resolved?: string; missing: string[]; blockedCommand?: string; failed?: boolean } {
   const missing: string[] = [];
 
   // The leading "!" must be literal in settings — it is checked before
@@ -86,18 +88,22 @@ function resolveValue(
   // inside repositories and are not a trusted execution source, so refuse to
   // run the command and surface it as a warning instead.
   const command = interpolate(value.slice(1), missing);
-  if (!allowExec) return { resolved: "", missing, blockedCommand: command };
+  // No `resolved` on block/failure: leave whatever the shell provided intact
+  // rather than clobbering a working credential with an empty string.
+  if (!allowExec) return { missing, blockedCommand: command };
 
   try {
     const output = execSync(command, {
       encoding: 'utf8',
       timeout: 5000,
       maxBuffer: 1024 * 1024,
+      // No stdin: a command that prompts would otherwise hang the TUI until timeout.
+      stdio: ["ignore", "pipe", "pipe"],
     });
     return { resolved: output.trim(), missing };
   } catch {
     // Report by key, not command: the interpolated command may contain secrets.
-    return { resolved: "", missing, failed: true };
+    return { missing, failed: true };
   }
 }
 
@@ -115,7 +121,8 @@ function isScalar(value: unknown): value is string | number | boolean {
 
 function readTracked(key: string): string[] {
   try {
-    return process.env[key] ? JSON.parse(process.env[key]) : [];
+    const parsed: unknown = process.env[key] ? JSON.parse(process.env[key]) : [];
+    return Array.isArray(parsed) ? parsed.filter((k): k is string => typeof k === "string" && KEY_PATTERN.test(k)) : [];
   } catch {
     return [];
   }
@@ -160,6 +167,7 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
   const reports: EnvReport[] = [];
   const unresolvedVars: string[] = [];
   const nonScalarKeys: string[] = [];
+  const invalidKeys: string[] = [];
   const blockedCommandKeys: string[] = [];
   const failedCommandKeys: string[] = [];
   const deniedKeys: string[] = [];
@@ -170,6 +178,10 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
     if (!source.vars) continue;
     const variables: Record<string, string> = {};
     for (const [key, value] of Object.entries(source.vars)) {
+      if (!KEY_PATTERN.test(key)) {
+        invalidKeys.push(key);
+        continue;
+      }
       if (!isScalar(value)) {
         nonScalarKeys.push(key);
         continue;
@@ -182,6 +194,7 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
       if (blockedCommand) blockedCommandKeys.push(key);
       if (failed) failedCommandKeys.push(key);
       unresolvedVars.push(...missing);
+      if (resolved === undefined) continue;
       process.env[key] = resolved;
       if (!appliedKeys.includes(key)) appliedKeys.push(key);
       variables[key] = resolved;
@@ -204,6 +217,7 @@ function applyEnv(cwd: string, projectTrusted: boolean): EnvResult {
     unresolvedVars: [...new Set(unresolvedVars)],
     overriddenVars,
     nonScalarKeys: [...new Set(nonScalarKeys)],
+    invalidKeys: [...new Set(invalidKeys)],
     blockedCommandKeys,
     failedCommandKeys,
     deniedKeys,
@@ -244,8 +258,7 @@ export default function (pi: ExtensionAPI): void {
       typeof message.content === "string"
         ? message.content
         : message.content
-            .filter((part: { type: string }) => part.type === "text")
-            .map((part: { type: string; text: string }) => part.text)
+            .flatMap((part) => (part.type === "text" ? [part.text] : []))
             .join("\n");
     return new Text(text, 0, 0);
   });
@@ -278,10 +291,11 @@ export default function (pi: ExtensionAPI): void {
 
     const warnings: Array<[string, string[]]> = [
       ["ignoring non-scalar values:", startup.nonScalarKeys],
+      ["ignoring invalid variable names:", startup.invalidKeys],
       ["unresolved variables:", startup.unresolvedVars],
       ["overriding existing variables:", startup.overriddenVars],
       ['blocked "!command" execution (project settings are untrusted):', startup.blockedCommandKeys],
-      ['"!command" failed (set to empty):', startup.failedCommandKeys],
+      ['"!command" failed (left unset):', startup.failedCommandKeys],
       ["refused from project settings (loader/network variable):", startup.deniedKeys],
     ];
     const lines = warnings
