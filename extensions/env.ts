@@ -240,7 +240,9 @@ async function applyEnv(cwd: string, projectTrusted: boolean): Promise<EnvResult
   // Phase 3: apply command results in settings order. A key a later source
   // already set in phase 1 keeps that value (project wins over global).
   for (const { key, command, variables } of commands) {
-    const { resolved, failed } = await runs.get(command)!;
+    const outcome = await runs.get(command);
+    if (!outcome) continue;
+    const { resolved, failed } = outcome;
     if (failed) {
       failedCommandKeys.push(`${key} (${failed})`);
       continue;
@@ -306,12 +308,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // Register styled message renderer
   pi.registerMessageRenderer(MESSAGE_TYPE, (message) => {
-    const text =
-      typeof message.content === "string"
-        ? message.content
-        : message.content
-            .flatMap((part) => (part.type === "text" ? [part.text] : []))
-            .join("\n");
+    let text = message.content;
+    if (Array.isArray(text)) text = text.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
     return new Text(text, 0, 0);
   });
 
@@ -351,14 +349,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ['"!command" failed (left unset):', startup.failedCommandKeys],
       ["refused from project settings (loader/network variable):", startup.deniedKeys],
     ];
-    const lines = warnings
-      .filter(([, keys]) => keys.length > 0)
-      .map(([label, keys]) => `  ${fg("warning", label)} ${keys.join(", ")}`);
+    const lines = warnings.flatMap(([label, keys]) =>
+      keys.length > 0 ? [`  ${fg("warning", label)} ${keys.join(", ")}`] : []
+    );
     if (lines.length === 0) return;
 
     const content = fg("accent", "[env]") + "\n" + lines.join("\n");
     if (!ctx.hasUI) {
-      console.error(content);
+      process.stderr.write(content + "\n");
       return;
     }
     pi.sendMessage({ customType: MESSAGE_TYPE, content, display: true });
